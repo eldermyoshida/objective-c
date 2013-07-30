@@ -44,7 +44,7 @@
 
 @property (nonatomic, strong) NSTimer *timeoutTimer;
 ;
-@property (nonatomic, getter = isConnectionSuspended) BOOL connectionSuspended;
+@property (nonatomic, assign, getter = isConnectionSuspended) BOOL connectionSuspended;
 
 
 #pragma mark - Instance methods
@@ -164,11 +164,6 @@
 - (BOOL)isConnected {
     
     return self.state == PNConnectionChannelStateConnected;
-}
-
-- (BOOL)isSendingData {
-
-    return [self.connection isSendingData];
 }
 
 - (void)disconnect {
@@ -377,10 +372,18 @@ shouldObserveProcessing:(BOOL)shouldObserveProcessing
 
 #pragma mark - Connection delegate methods
 
+- (void)connectionConfigurationDidFail:(PNConnection *)connection {
+
+    self.state = PNConnectionChannelStateDisconnected;
+    [self.delegate connectionChannelConfigurationDidFail:self];
+
+    // Stop any request processing
+    [self unscheduleNextRequest];
+}
+
 - (void)connection:(PNConnection *)connection didConnectToHost:(NSString *)hostName {
     
     self.state = PNConnectionChannelStateConnected;
-    
     
     [self.delegate connectionChannel:self didConnectToHost:hostName];
     
@@ -399,7 +402,13 @@ shouldObserveProcessing:(BOOL)shouldObserveProcessing
 
 - (void)connection:(PNConnection *)connection didReconnectOnErrorToHost:(NSString *)hostName {
 
+    self.state = PNConnectionChannelStateConnected;
+
     [self.delegate connectionChannel:self didReconnectOnErrorToHost:hostName];
+
+    // Launch communication process on sockets by triggering
+    // requests queue processing
+    [self scheduleNextRequest];
 }
 
 - (void)connection:(PNConnection *)connection didReceiveResponse:(PNResponse *)response {
@@ -434,7 +443,7 @@ shouldObserveProcessing:(BOOL)shouldObserveProcessing
         // read/write streams)
         if (![connection isDisconnected]) {
             
-            [connection closeConnection];
+            [connection closeConnectionByUserRequest:NO];
         }
 
 

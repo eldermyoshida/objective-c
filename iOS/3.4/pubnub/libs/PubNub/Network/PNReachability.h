@@ -61,6 +61,7 @@
  * any callbacks
  */
 - (void)refreshReachabilityState;
+- (void)refreshReachabilityState2;
 
 /**
  * Allow to update current reachability state according to the

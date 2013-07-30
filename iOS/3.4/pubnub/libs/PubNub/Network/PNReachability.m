@@ -117,37 +117,44 @@ typedef enum _PNReachabilityStatus {
  */
 static PNReachabilityStatus PNReachabilityStatusForFlags(SCNetworkReachabilityFlags flags);
 PNReachabilityStatus PNReachabilityStatusForFlags(SCNetworkReachabilityFlags flags) {
-    
-    PNReachabilityStatus status = PNReachabilityStatusUnknown;
-    
-    
+
+    PNReachabilityStatus status = (flags == 0) ? PNReachabilityStatusUnknown : PNReachabilityStatusNotReachable;
+
+
     // Check whether service origin can be reached with
     // current network configuration or not
-    BOOL isServiceReachable = ((flags&kSCNetworkReachabilityFlagsReachable) != 0);
-    
-    // Check whether service origin can be reached right
-    // now or connection is required (device can connect
-    // for cellular/WiFi network)
-    BOOL requiresConnection = ((flags&kSCNetworkReachabilityFlagsConnectionRequired) != 0);
-    
-    
-    // Check whether service can be reached right not or not
-    if (isServiceReachable && !requiresConnection) {
-        
-        status = PNReachabilityStatusReachableViaWiFi;
-        
+    BOOL isServiceReachable = ((flags & kSCNetworkReachabilityFlagsReachable) != 0);
+
+    if (isServiceReachable) {
+
 #if __IPHONE_OS_VERSION_MIN_REQUIRED
-        // Check whether service origin can be reached over
-        // cellular channel of hand-held devices or not
-        if ((flags&kSCNetworkReachabilityFlagsIsWWAN) != 0) {
-            
-            status = PNReachabilityStatusReachableViaCellular;
-        }
+        status = (flags & kSCNetworkReachabilityFlagsIsWWAN) != 0 ? PNReachabilityStatusReachableViaCellular : status;
 #endif
-    }
-    else {
-        
-        status = PNReachabilityStatusNotReachable;
+
+        if (status == PNReachabilityStatusUnknown || status == PNReachabilityStatusNotReachable) {
+
+            status = PNReachabilityStatusReachableViaWiFi;
+
+            flags &= ~kSCNetworkReachabilityFlagsReachable;
+            flags &= ~kSCNetworkReachabilityFlagsIsDirect;
+            flags &= ~kSCNetworkReachabilityFlagsIsLocalAddress;
+
+            if (flags != 0) {
+
+                status = PNReachabilityStatusNotReachable;
+
+                // Check whether connection is down (required connection)
+                if (flags != (kSCNetworkReachabilityFlagsConnectionRequired |
+                              kSCNetworkReachabilityFlagsTransientConnection)) {
+
+                    if ((flags & kSCNetworkReachabilityFlagsConnectionRequired) != 0 ||
+                        (flags & kSCNetworkReachabilityFlagsTransientConnection) != 0) {
+
+                        status = PNReachabilityStatusReachableViaWiFi;
+                    }
+                }
+            }
+        }
     }
     
     
@@ -160,12 +167,12 @@ PNReachabilityStatus PNReachabilityStatusForFlags(SCNetworkReachabilityFlags fla
  * service changed it's reachability state
  */
 static void PNReachabilityCallback(SCNetworkReachabilityRef reachability, SCNetworkReachabilityFlags flags, void *info);
-void PNReachabilityCallback(SCNetworkReachabilityRef reachability, SCNetworkReachabilityFlags flags, void *info) {
+void PNReachabilityCallback(SCNetworkReachabilityRef reachability __unused, SCNetworkReachabilityFlags flags, void *info) {
     
     // Verify that reachability callback was called for correct client
     NSCAssert([(__bridge NSObject *)info isKindOfClass:[PNReachability class]],
               @"Wrong instance has been sent as reachability observer");
-    
+    NSLog(@">>>>> REACHABILITY CHANGED: %i", PNReachabilityStatusForFlags(flags));
     
     // Retrieve reference on reachability monitor and update it's state
     PNReachability *reachabilityMonitor = (__bridge PNReachability *)info;

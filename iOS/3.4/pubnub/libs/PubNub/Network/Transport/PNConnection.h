@@ -78,19 +78,12 @@
 - (BOOL)isDisconnected;
 
 /**
- * Check whether connection has active request which should be
- * sent or not
- */
-- (BOOL)isSendingData;
-
-/**
  * Reconnect sockets and streams by user request
  */
 - (void)reconnect;
 
 /**
- * Close socket and streams on particular 
- * connection instance
+ * Close socket and streams on particular connection instance
  */
 - (void)closeConnection;
 

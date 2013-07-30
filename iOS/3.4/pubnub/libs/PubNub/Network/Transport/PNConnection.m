@@ -11,34 +11,16 @@
 //
 //
 
-#import "PNConnection.h"
+#import "PNConnection+Protected.h"
 #import <Security/SecureTransport.h>
 #import "PNConnection+Protected.h"
 #import "PNResponseDeserialize.h"
 #import "PubNub+Protected.h"
 #import "PNWriteBuffer.h"
+#import <netdb.h>
 
 
 #pragma mark Structures
-
-typedef enum _PNConnectionSSLConfigurationLevel {
-
-    // This option will check all information on
-    // remote origin SSL certificate to ensure in
-    // authority
-    PNConnectionSSLConfigurationStrict,
-
-    // This option will skip most of validations
-    // and as fact will allow to work with server
-    // which uses invalid SSL certificate or certificate
-    // from another server
-    PNConnectionSSLConfigurationBarelySecure,
-
-    // This option will tell that connection should
-    // be opened w/o SSL (if user won't to discard
-    // security options)
-    PNConnectionSSLConfigurationInSecure,
-} PNConnectionSSLConfigurationLevel;
 
 struct PNConnectionIdentifiersStruct PNConnectionIdentifiers = {
     
@@ -63,6 +45,12 @@ static UInt32 const kPNOriginSSLConnectionPort = 443;
 // Default data buffer size (Default: 32kb)
 static int const kPNStreamBufferSize = 32768;
 
+// Delay after which connection should retry
+static int64_t const kPNConnectionRetryDelay = 2;
+
+// Maximum retry count which can be performed for single operation
+static NSUInteger const kPNMaximumRetryCount = 3;
+
 
 #pragma mark - Private interface methods
 
@@ -79,20 +67,6 @@ static int const kPNStreamBufferSize = 32768;
 // Stores flag of whether connection should process next
 // request from queue or not
 @property (nonatomic, assign, getter = shouldProcessNextRequest) BOOL processNextRequest;
-
-// Stores flag on whether connecion is closing or not
-@property (nonatomic, assign, getter = isClosingConnection) BOOL closingConnection;
-
-// Stores whether connection instance is reconnecting at
-// this moment (which will mean that it should automatically
-// open connection after full close)
-@property (nonatomic, assign, getter = isReconnecting) BOOL reconnecting;
-
-// Stores whether connection instance is restoring connection
-// because of error or not
-@property (nonatomic, assign, getter = isReconnectingOnError) BOOL reconnectingOnError;
-
-@property (nonatomic, getter = isConnectionSuspended) BOOL connectionSuspended;
 
 // Stores reference on response deserializer which will parse
 // response into objects array and update provided data to
@@ -111,6 +85,21 @@ static int const kPNStreamBufferSize = 32768;
 // Stores reference on buffer which should be sent to
 // the PubNub service via socket
 @property (nonatomic, strong) PNWriteBuffer *writeBuffer;
+@property (nonatomic, assign) PNConnectionDataSendingState dataSendingState;
+
+// Stores current overall connection state
+@property (nonatomic, assign) PNConnectionState state;
+
+// Stores whether connection process was initialized by user or it was internally called by library
+// in one of catchup logic
+@property (nonatomic, assign, getter = isConnectingByUserRequest) BOOL connectingByUserRequest;
+
+// Stores whether disconnection process was initialized by user or it was internally called by library
+// in one of catchup logic
+@property (nonatomic, assign, getter = isDisconnectingByUserRequest) BOOL disconnectingByUserRequest;
+
+// Stores how many times connection retried last operation before reporting error
+@property (nonatomic, assign) NSUInteger retryCount;
 
 // Socket streams and state
 @property (nonatomic, assign) CFReadStreamRef socketReadStream;
@@ -186,11 +175,8 @@ static int const kPNStreamBufferSize = 32768;
  * settings.
  */
 - (void)configureReadStream:(CFReadStreamRef)readStream;
-
 - (void)openReadStream:(CFReadStreamRef)readStream;
-
 - (void)disconnectReadStream:(CFReadStreamRef)readStream shouldHandleCloseEvent:(BOOL)shouldHandleCloseEvent;
-
 - (void)destroyReadStream:(CFReadStreamRef)readStream;
 
 /**
@@ -213,11 +199,8 @@ static int const kPNStreamBufferSize = 32768;
  * settings.
  */
 - (void)configureWriteStream:(CFWriteStreamRef)writeStream;
-
 - (void)openWriteStream:(CFWriteStreamRef)writeStream;
-
 - (void)disconnectWriteStream:(CFWriteStreamRef)writeStream shouldHandleCloseEvent:(BOOL)shouldHandleCloseEvent;
-
 - (void)destroyWriteStream:(CFWriteStreamRef)writeStream;
 
 /**
@@ -269,11 +252,8 @@ static int const kPNStreamBufferSize = 32768;
 - (NSString *)stringifyStreamStatus:(CFStreamStatus)status;
 
 - (void)handleStreamError:(CFErrorRef)error;
-
 - (void)handleStreamError:(CFErrorRef)error shouldCloseConnection:(BOOL)shouldCloseConnection;
-
 - (void)handleStreamSetupError;
-
 - (void)handleRequestProcessingError:(CFErrorRef)error;
 
 
@@ -298,9 +278,8 @@ static int const kPNStreamBufferSize = 32768;
  * Connection state retrieval
  */
 - (BOOL)isConfigured;
-
 - (BOOL)isConnecting;
-
+- (BOOL)isReconnecting;
 - (BOOL)isReady;
 
 - (CFStreamClientContext)streamClientContext;
@@ -374,7 +353,6 @@ static int const kPNStreamBufferSize = 32768;
         }];
 
         [[self connectionsPool] removeObjectsForKeys:connectionIdentifiersForDelete];
-
     }
 }
 
@@ -431,9 +409,14 @@ static int const kPNStreamBufferSize = 32768;
         // Perform connection initialization
         self.configuration = configuration;
         self.deserializer = [PNResponseDeserialize new];
+        self.state = PNConnectionCreated;
 
         // Perform streams initial options and security initializations
-        [self prepareStreams];
+        if (![self prepareStreams]) {
+
+            self.state = PNConnectionNotConfigured;
+            [self handleStreamSetupError];
+        }
     }
 
 
@@ -447,15 +430,20 @@ static int const kPNStreamBufferSize = 32768;
 
     self.processNextRequest = YES;
 
-    // Checking whether we have write buffer with data
-    // or not
-    if (self.writeBuffer == nil || ![self.writeBuffer hasData]) {
+    // Check whether connection ready and there is data source which will provide packets for execution
+    if ([self isConnected]) {
 
-        self.writeBuffer = nil;
+        // Check whether data sending has been interrupted last time and
+        // renew it if possible
+        if (self.dataSendingState == PNConnectionDataSendingInterrupted) {
 
+            // Make buffer valid to be sent once more
+            [self.writeBuffer reset];
 
-        // Check whether connection ready and there is data source which will provide packets for execution
-        if ([self isConnected]) {
+            // Try to initiate request sending process
+            [self writeBufferContent];
+        }
+        else if (self.dataSendingState == PNConnectionDataWaitingForNewData) {
 
             [self prepareNextRequestPacket];
 
@@ -463,17 +451,21 @@ static int const kPNStreamBufferSize = 32768;
             [self writeBufferContent];
         }
     }
-    // Check whether write buffer already created, has data and because of some
-    // reasons not processing and not sending data to the remote server
-    else if(self.writeBuffer != nil && [self.writeBuffer hasData] &&
-            [self.writeBuffer isPartialDataSent] && !self.writeBuffer.isSendingBytes) {
-
-        [self writeBuffer];
-    }
 
 }
 
 - (void)unscheduleRequestsExecution {
+
+    // Check whether data sending layer is processing some request or not
+    if (self.dataSendingState == PNConnectionDataSending) {
+
+        // Notify delegate about that request processing hasn't been completed
+        [self.dataSource connection:self didCancelRequestWithIdentifier:_writeBuffer.requestIdentifier];
+
+        // Clean up
+        _writeBuffer = nil;
+        self.dataSendingState = PNConnectionDataWaitingForNewData;
+    }
 
     self.processNextRequest = NO;
 }
@@ -484,7 +476,7 @@ static int const kPNStreamBufferSize = 32768;
 void readStreamCallback(CFReadStreamRef stream, CFStreamEventType type, void *clientCallBackInfo) {
 
     NSCAssert([(__bridge id)clientCallBackInfo isKindOfClass:[PNConnection class]],
-    @"{ERROR}[READ] WRONG CLIENT INSTANCE HAS BEEN SENT AS CLIENT");
+              @"{ERROR}[READ] WRONG CLIENT INSTANCE HAS BEEN SENT AS CLIENT");
     PNConnection *connection = (__bridge PNConnection *)clientCallBackInfo;
 
     NSString *status = [connection stringifyStreamStatus:CFReadStreamGetStatus(stream)];
@@ -593,32 +585,35 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
 - (BOOL)isReady {
 
-    return (self.readStreamState == PNSocketStreamReady && self.writeStreamState == PNSocketStreamReady);
+    return [self isConfigured] && ![self isConnecting] && ![self isConnected];
 }
 
 - (BOOL)isConfigured {
 
-    return (self.readStreamState != PNSocketStreamNotConfigured && self.writeStreamState != PNSocketStreamNotConfigured);
+    return self.state != PNConnectionCreated &&
+           self.state != PNConnectionNotConfigured &&
+           self.state != PNConnectionConfigurationError &&
+           self.state != PNConnectionConfigurationErrorOnConnect;
 }
 
 - (BOOL)isConnecting {
 
-    return (self.readStreamState == PNSocketStreamConnecting && self.writeStreamState == PNSocketStreamConnecting);
+    return ![self isConnected] && (self.state == PNConnectionConnecting || [self isReconnecting]);
+}
+
+- (BOOL)isReconnecting {
+
+    return self.state == PNConnectionReconnecting || self.state == PNConnectionReconnectingOnError;
 }
 
 - (BOOL)isConnected {
 
-    return (self.readStreamState == PNSocketStreamConnected && self.writeStreamState == PNSocketStreamConnected && !self.isReconnecting);
+    return self.state != PNConnectionCreated && self.state == PNConnectionConnected;
 }
 
 - (BOOL)isDisconnected {
 
-    return (self.readStreamState == PNSocketStreamNotConfigured && self.writeStreamState == PNSocketStreamNotConfigured);
-}
-
-- (BOOL)isSendingData {
-
-    return [self isConnected] && (self.writeBuffer != nil && [self.writeBuffer hasData] && [self.writeBuffer hasData]);
+    return self.state = PNConnectionDisconnected;
 }
 
 - (BOOL)isConnectionIssuesError:(CFErrorRef)error {
@@ -649,8 +644,12 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
             case kCFHostErrorHostNotFound:
             case kCFHostErrorUnknown:
-
+            {
+//                EAI_NONAME
+                NSDictionary *userInfo = (__bridge_transfer NSDictionary *)CFErrorCopyUserInfo(error);
+                NSLog(@">>>>>>> USERINFO: %@", userInfo);
                 isConnectionIssue = YES;
+            }
                 break;
         }
     }
@@ -725,20 +724,22 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
     BOOL streamsPrepared = YES;
 
-
     // Check whether stream was prepared and configured before
-    if ([self isConfigured] || [self isConnected] || [self isReady]) {
+    if ([self isReady]) {
 
         PNLog(PNLogConnectionLayerErrorLevel, self, @"[CONNECTION::%@] SOCKET AND STREAMS ALREADY CONFIGURATED",
-              self.name);
+              self.name ? self.name : self);
     }
     else {
 
-        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" configuration", self.name?self.name:self);
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CONFIGURATION STARTED",
+              self.name ? self.name : self);
 
+        // Define connection port which should be used by connection for further usage
+        // (depends on current connection security policy)
         UInt32 targetPort = kPNOriginConnectionPort;
         if (self.configuration.shouldUseSecureConnection &&
-            self.sslConfigurationLevel != PNConnectionSSLConfigurationInSecure) {
+            self.sslConfigurationLevel != PNConnectionSSLConfigurationInsecure) {
 
             targetPort = kPNOriginSSLConnectionPort;
         }
@@ -765,8 +766,17 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
         // failed
         if (self.readStreamState != PNSocketStreamReady || self.writeStreamState != PNSocketStreamReady) {
 
+            self.state = PNConnectionConfigurationError;
             streamsPrepared = NO;
-            [self closeStreams];
+
+            if (self.isConnectingByUserRequest) {
+
+                [self closeStreams];
+            }
+        }
+        else {
+
+            self.state = PNConnectionNotConnected;
         }
     }
 
@@ -776,8 +786,14 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
 - (void)closeStreams {
 
-    self.connectionSuspended = NO;
-    self.closingConnection = YES;
+    if ([self isConnected]) {
+
+        self.state = PNConnectionDisconnecting;
+    }
+    else {
+
+        self.state = PNConnectionDisconnected;
+    }
 
     // Clean up cached data
     [self unscheduleRequestsExecution];
@@ -790,49 +806,66 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
 - (BOOL)connect {
 
-    self.closingConnection = NO;
+    return [self connectByUserRequest:YES];
+}
+
+- (BOOL)connectByUserRequest:(BOOL)isConnectingByUserRequest {
+
+    self.connectingByUserRequest = isConnectingByUserRequest;
     BOOL isStreamOpened = NO;
 
-    if (![self isConnected] && [self isReady]) {
+    if ([self isReady]) {
 
-        if (![self isConnecting]) {
+        if (self.state == PNConnectionSuspended) {
 
-            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" connecting", self.name);
+            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] RESUMING...",
+                  self.name ? self.name : self);
 
-            [self openReadStream:self.socketReadStream];
-            [self openWriteStream:self.socketWriteStream];
+            self.state = PNConnectionResuming;
         }
         else {
 
-            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" already connected", self.name);
+            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CONNECTING...",
+                  self.name ? self.name : self);
 
+            self.state = PNConnectionConnecting;
         }
+        [self openReadStream:self.socketReadStream];
+        [self openWriteStream:self.socketWriteStream];
 
         isStreamOpened = YES;
     }
-    // Looks like streams not ready yet (maybe stream closed
-    // during previous session)
-    else if (![self isReady] && ![self isConnected]) {
+    else if (![self isConfigured]) {
 
-        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" not configured yet", self.name);
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] NOT CONFIGURED",
+              self.name ? self.name : self);
 
-        if (![self isConnecting]) {
+        // Try prepare connection's streams for future usage
+        if ([self prepareStreams]) {
 
-            if ([self prepareStreams]) {
+            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CONFIGURED",
+                  self.name ? self.name : self);
 
-                PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" configured", self.name);
-
-                [self connect];
-            }
-            else {
-
-                [self handleStreamSetupError];
-            }
+            [self connect];
         }
         else {
 
-            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" not configured, but tries to connect", self.name);
+            PNLog(PNLogCommunicationChannelLayerErrorLevel, self, @"[CONNECTION::%@] CONFIGURATION FAILED",
+                  self.name ? self.name : self);
+
+            self.state = PNConnectionConfigurationErrorOnConnect;
+            [self handleStreamSetupError];
         }
+    }
+    else if ([self isConnecting]) {
+
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] ALREADY CONNECTING",
+              self.name ? self.name : self);
+    }
+    else {
+
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] ALREADY CONNECTED",
+              self.name ? self.name : self);
     }
 
 
@@ -841,62 +874,72 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
 - (void)reconnect {
 
-    self.connectionSuspended = NO;
+    if (self.state != PNConnectionReconnectingOnError) {
 
-    // Marking that connection instance is reconnecting
-    // now and after last connection will be closed should
-    // automatically renew connection
-    self.reconnecting = YES;
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] IS RECONNECTING",
+              self.name ? self.name : self);
+
+        self.state = PNConnectionReconnecting;
+    }
 
     [self disconnectStreams];
 }
 
 - (void)reconnectOnError {
 
-    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" Reconnecting \"%@\" channel because of error", self.name);
+    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] IS RECONNECTING ON ERROR",
+          self.name ? self.name : self);
 
-    self.reconnectingOnError = YES;
+    self.state = PNConnectionReconnectingOnError;
+
     [self reconnect];
 }
 
 - (void)disconnectStreams {
 
-    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" is disconnecting connections", self.name);
-    
+    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] IS DISCONNECTING STREAMS",
+          self.name ? self.name : self);
+
     [self disconnectReadStream:_socketReadStream shouldHandleCloseEvent:NO];
     [self disconnectWriteStream:_socketWriteStream shouldHandleCloseEvent:NO];
-    [self destroyReadStream:_socketReadStream];
-    [self destroyWriteStream:_socketWriteStream];
     
     [self handleStreamClose];
 }
 
 - (void)closeConnection {
 
-    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" is closing connection", self.name);
+    [self closeConnectionByUserRequest:YES];
+}
 
-    self.connectionSuspended = NO;
-    self.reconnectingOnError = NO;
-    self.reconnecting = NO;
+- (void)closeConnectionByUserRequest:(BOOL)isDisconnectingByUserRequest {
+
+    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] IS CLOSING CONNECTION",
+          self.name ? self.name : self);
+
+    self.disconnectingByUserRequest = isDisconnectingByUserRequest;
+
     [self closeStreams];
 }
 
 - (void)suspend {
 
-    if (!self.isConnectionSuspended && [self isConnected]) {
+    if ([self isConnected] && self.state != PNConnectionSuspending && self.state != PNConnectionSuspended) {
 
-        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" Suspend \"%@\" connection sockets", self.name);
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] SUSPENDING",
+              self.name ? self.name : self);
 
-        self.connectionSuspended = YES;
+        self.state = PNConnectionSuspending;
+
         [self disconnectStreams];
     }
 }
 
 - (void)resume {
 
-    if (self.isConnectionSuspended) {
+    if (self.state != PNConnectionSuspending && self.state == PNConnectionSuspended) {
 
-        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" Resume \"%@\" connection sockets", self.name);
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" Resume \"%@\" connection sockets",
+              self.name ? self.name : self);
 
         [self connect];
     }
@@ -946,14 +989,25 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 - (void)disconnectReadStream:(CFReadStreamRef)readStream shouldHandleCloseEvent:(BOOL)shouldHandleCloseEvent {
     
     self.readStreamState = PNSocketStreamNotConfigured;
-    
+
+    // Check whether there is some data received from server and try to
+    // parse it
+    if ([_retrievedData length] > 0) {
+
+        [self processResponse];
+    }
+
     // Destroying input buffer
     _retrievedData = nil;
     
     
     if (readStream != NULL) {
-        
+
+        CFReadStreamSetClient(readStream, kCFStreamEventNone, NULL, NULL);
         CFReadStreamClose(readStream);
+
+        PNCFRelease(&readStream);
+        self.socketReadStream = NULL;
         
         if (shouldHandleCloseEvent) {
             
@@ -961,42 +1015,15 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
         }
         else {
 
-            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" closed read stream", self.name);
+            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CLOSED READ STREAM", self.name);
         }
     }
 }
 
 - (void)destroyReadStream:(CFReadStreamRef)readStream {
 
-    BOOL shouldCloseStream = self.readStreamState == PNSocketStreamConnected || self.readStreamState == PNSocketStreamConnecting;
-    self.readStreamState = PNSocketStreamNotConfigured;
-
-    // Destroying input buffer
-    _retrievedData = nil;
-
-
-    if (readStream != NULL) {
-
-        // Unschedule read stream from runloop
-        CFReadStreamSetClient(readStream, kCFStreamEventNone, NULL, NULL);
-        CFReadStreamUnscheduleFromRunLoop(readStream, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
-
-        // Checking whether read stream is opened and
-        // close it if required
-        if (shouldCloseStream) {
-
-            CFReadStreamClose(readStream);
-        }
-
-        PNCFRelease(&readStream);
-        self.socketReadStream = NULL;
-    }
-
-
-    if (shouldCloseStream) {
-
-        [self handleStreamClose];
-    }
+    BOOL shouldHandleCloseEvent = self.readStreamState == PNSocketStreamConnected || self.readStreamState == PNSocketStreamConnecting;
+    [self disconnectReadStream:readStream shouldHandleCloseEvent:shouldHandleCloseEvent];
 }
 
 - (void)openReadStream:(CFReadStreamRef)readStream {
@@ -1020,7 +1047,7 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
     }
     else {
 
-        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" opened read stream", self.name);
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] OPENED READ STREAM", self.name);
     }
 }
 
@@ -1143,22 +1170,33 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
     
     self.writeStreamState = PNSocketStreamNotConfigured;
     self.writeStreamCanHandleData = NO;
-    
-    // Check whether write buffer was currently processed or not
-    if (_writeBuffer && [_writeBuffer hasData] &&
-        [_writeBuffer isPartialDataSent] && _writeBuffer.isSendingBytes) {
-        
-        // Notify delegate about that request processing hasn't been completed
-        [self.dataSource connection:self didCancelRequestWithIdentifier:_writeBuffer.requestIdentifier];
-        
-        // Clean up
-        _writeBuffer = nil;
+
+    // Check whether data sending layer is processing some request or not
+    if (self.dataSendingState == PNConnectionDataSending) {
+
+        if (!self.isDisconnectingByUserRequest) {
+
+            self.dataSendingState = PNConnectionDataSendingInterrupted;
+        }
+        else {
+
+            // Notify delegate about that request processing hasn't been completed
+            [self.dataSource connection:self didCancelRequestWithIdentifier:_writeBuffer.requestIdentifier];
+
+            // Clean up
+            _writeBuffer = nil;
+            self.dataSendingState = PNConnectionDataWaitingForNewData;
+        }
     }
     
     
     if (writeStream != NULL) {
-        
+
+        CFWriteStreamSetClient(writeStream, kCFStreamEventNone, NULL, NULL);
         CFWriteStreamClose(writeStream);
+
+        PNCFRelease(&writeStream);
+        self.socketWriteStream = NULL;
         
         if (shouldHandleCloseEvent) {
             
@@ -1166,50 +1204,15 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
         }
         else {
 
-            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" closed write stream", self.name);
+            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CLOSED WRITE STREAM", self.name);
         }
     }
 }
 
 - (void)destroyWriteStream:(CFWriteStreamRef)writeStream {
 
-    BOOL shouldCloseStream = self.writeStreamState == PNSocketStreamConnected || self.writeStreamState == PNSocketStreamConnecting;;
-    self.writeStreamState = PNSocketStreamNotConfigured;
-    self.writeStreamCanHandleData = NO;
-
-    // Check whether write buffer was currently processed or not
-    if (_writeBuffer && [_writeBuffer hasData] &&
-        [_writeBuffer isPartialDataSent] && _writeBuffer.isSendingBytes) {
-
-        // Notify delegate about that request processing hasn't been completed
-        [self.dataSource connection:self didCancelRequestWithIdentifier:_writeBuffer.requestIdentifier];
-
-        // Clean up
-        _writeBuffer = nil;
-    }
-
-
-    if (writeStream != NULL) {
-
-        // Unschedule write stream from runloop
-        CFWriteStreamSetClient(writeStream, kCFStreamEventNone, NULL, NULL);
-        CFWriteStreamUnscheduleFromRunLoop(writeStream, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
-
-        // Checking whether write stream is opened and
-        // close it if required
-        if (shouldCloseStream) {
-
-            CFWriteStreamClose(writeStream);
-        }
-
-        PNCFRelease(&writeStream);
-        self.socketWriteStream = NULL;
-    }
-
-    if (shouldCloseStream) {
-
-        [self handleStreamClose];
-    }
+    BOOL shouldHandleCloseEvent = self.writeStreamState == PNSocketStreamConnected || self.writeStreamState == PNSocketStreamConnecting;
+    [self disconnectWriteStream:writeStream shouldHandleCloseEvent:shouldHandleCloseEvent];
 }
 
 
@@ -1329,18 +1332,19 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
     // delegate about successful connection
     if (self.readStreamState == PNSocketStreamConnected && self.writeStreamState == PNSocketStreamConnected) {
 
-        self.reconnecting = NO;
+        BOOL isResumed = self.state == PNConnectionResuming;
+        BOOL isReconnectedOnError = self.state == PNConnectionReconnectingOnError;
+        self.state = PNConnectionConnected;
+
         [self.delegate connection:self didConnectToHost:self.configuration.origin];
 
-        if (self.isConnectionSuspended) {
+        if (isResumed) {
 
-            self.connectionSuspended = NO;
             [self.delegate connectionDidResume:self];
         }
 
-        if (self.isReconnectingOnError) {
+        if (isReconnectedOnError) {
 
-            self.reconnectingOnError = NO;
             [self.delegate connection:self didReconnectOnErrorToHost:self.configuration.origin];
         }
     }
@@ -1348,29 +1352,55 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
 - (void)handleStreamClose {
 
-    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" channel stream states: %d / %d",
-            self.name, self.readStreamState, self.writeStreamState);
+    PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CLOSED ONE OF THESTREAMS (%d / %d)",
+          self.name, self.readStreamState, self.writeStreamState);
 
     // Ensure that both read and write streams reset before notify delegate
     // about connection close event
     if (self.readStreamState == PNSocketStreamNotConfigured && self.writeStreamState == PNSocketStreamNotConfigured) {
 
-        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" closed all streams", self.name);
+        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] CLOSED ALL STREAMS", self.name);
 
         // Checking whether instance is reconnecting or not
-        if(self.isReconnecting) {
+        if(self.state == PNConnectionReconnecting || self.state == PNConnectionReconnectingOnError) {
 
-            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" should reconnect", self.name);
+            PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] SHOULD RECONNECT", self.name);
 
-            [self connect];
+            if (self.state == PNConnectionReconnecting) {
+
+                PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] RECONNECTING...", self.name);
+                [self connect];
+            }
+            else {
+
+                __pn_desired_weak __typeof__(self) weakSelf = self;
+                dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t) (kPNConnectionRetryDelay * NSEC_PER_SEC));
+                dispatch_after(popTime, dispatch_get_main_queue(), ^{
+
+                    // Check whether connection is still in bad state before issue connection
+                    if (weakSelf.state == PNConnectionReconnectingOnError) {
+
+                        PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] RECONNECTING ON ERROR...", self.name);
+
+                        [weakSelf connect];
+                    }
+                });
+
+            }
         }
         else {
 
-            if (!self.isConnectionSuspended) {
+            if (self.state != PNConnectionSuspending) {
 
-                PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" Notify delegate that \"%@\" disconnected", self.name);
+                self.state = PNConnectionDisconnected;
+                PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] DISCONNECTED", self.name);
 
                 [self.delegate connection:self didDisconnectFromHost:self.configuration.origin];
+            }
+            else {
+
+                PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @"[CONNECTION::%@] SUSPENDED",
+                      self.name ? self.name : self);
             }
         }
     }
@@ -1489,7 +1519,7 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
                     
                     shouldNotifyDelegate = NO;
                     
-                    self.sslConfigurationLevel = PNConnectionSSLConfigurationInSecure;
+                    self.sslConfigurationLevel = PNConnectionSSLConfigurationInsecure;
                     
                     // Try to reconnect with new SSL security settings
                     [self reconnectOnError];
@@ -1576,11 +1606,48 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 
 - (void)handleStreamSetupError {
 
-    // Prepare error message which will be
-    // sent to connection channel delegate
-    PNError *setupError = [PNError errorWithCode:kPNConnectionErrorOnSetup];
+    if (self.isConnectingByUserRequest) {
 
-    [self.delegate connection:self connectionDidFailToHost:self.configuration.origin withError:setupError];
+        // Prepare error message which will be
+        // sent to connection channel delegate
+        PNError *setupError = [PNError errorWithCode:kPNConnectionErrorOnSetup];
+
+        [self.delegate connection:self connectionDidFailToHost:self.configuration.origin withError:setupError];
+    }
+    else if (self.state == PNConnectionConfigurationError || self.state == PNConnectionConfigurationErrorOnConnect) {
+
+        __pn_desired_weak __typeof__(self) weakSelf = self;
+        int64_t delay = self.state == PNConnectionConfigurationErrorOnConnect ? kPNConnectionRetryDelay : 1;
+        dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t) (delay * NSEC_PER_SEC));
+
+        void(^delayedBlock)(void) = ^{
+
+            // Check whether connection is still in bad state before issue connection
+            if (weakSelf.state == PNConnectionConfigurationError ||
+                weakSelf.state == PNConnectionConfigurationErrorOnConnect) {
+
+                if (self.retryCount + 1 < kPNMaximumRetryCount) {
+
+                    weakSelf.retryCount++;
+                    if (self.state == PNConnectionConfigurationError) {
+
+                        [weakSelf prepareStreams];
+                    }
+                    else {
+
+                        [weakSelf connect];
+                    }
+                }
+                else {
+
+                    weakSelf.retryCount = 0;
+                    [weakSelf.delegate connectionConfigurationDidFail:self];
+                }
+            }
+        };
+
+        dispatch_after(popTime, dispatch_get_main_queue(), delayedBlock);
+    }
 }
 
 - (void)handleRequestProcessingError:(CFErrorRef)error {
@@ -1607,7 +1674,7 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
 - (CFMutableDictionaryRef)streamSecuritySettings {
 
     if (self.configuration.shouldUseSecureConnection && _streamSecuritySettings == NULL &&
-        self.sslConfigurationLevel != PNConnectionSSLConfigurationInSecure) {
+        self.sslConfigurationLevel != PNConnectionSSLConfigurationInsecure) {
 
         // Configure security settings
         _streamSecuritySettings = CFDictionaryCreateMutable(CFAllocatorGetDefault(), 6, NULL, NULL);
@@ -1631,7 +1698,7 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
         }
     }
     else if (!self.configuration.shouldUseSecureConnection ||
-             self.sslConfigurationLevel == PNConnectionSSLConfigurationInSecure) {
+             self.sslConfigurationLevel == PNConnectionSSLConfigurationInsecure) {
 
         PNCFRelease(&_streamSecuritySettings);
     }
@@ -1698,6 +1765,7 @@ void writeStreamCallback(CFWriteStreamRef stream, CFStreamEventType type, void *
     // Closing all streams and free up resources
     // which was allocated for their support
     [self closeConnection];
+
     _delegate = nil;
     _proxySettings = nil;
     PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" \"%@\" destroyed", self.name);

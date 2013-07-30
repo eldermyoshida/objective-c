@@ -287,6 +287,17 @@
 
 #pragma mark - Connection management
 
+- (void)connect {
+
+    if (!self.isConnectionSuspended && [self canResubscribe]) {
+
+        [self.delegate connectionWillResume:self];
+    }
+
+    // Forward to the super class
+    [super connect];
+}
+
 - (void)reconnect {
     
     [self reconnect:YES];
@@ -421,6 +432,7 @@
         // event generation
         NSArray *oldChannels = [self unsubscribeFromChannelsWithPresenceEvent:YES byUserRequest:YES];
 
+        NSLog(@"%s | %@", __PRETTY_FUNCTION__, [NSThread callStackSymbols]);
         [self scheduleRequest:[PNSubscribeRequest subscribeRequestForChannels:oldChannels byUserRequest:YES]
       shouldObserveProcessing:YES];
     }
@@ -447,9 +459,10 @@
             [self.subscribedChannelsSet makeObjectsPerformSelector:@selector(resetUpdateTimeToken)];
         }
 
-        self.restoringSubscription = !shouldRestoreImmediately;
+        self.restoringSubscription = !shouldRestoreImmediately && shouldRestoreResubscriptionFromLastTimeToken;
 
 
+        NSLog(@"%s | %@", __PRETTY_FUNCTION__, [NSThread callStackSymbols]);
         PNSubscribeRequest *resubscribeRequest = [PNSubscribeRequest subscribeRequestForChannels:[self.subscribedChannelsSet allObjects]
                                                                         byUserRequest:YES];
 
@@ -479,6 +492,7 @@
 
         PNLog(PNLogCommunicationChannelLayerInfoLevel, self, @" UPDATE CHANNELS SUBSCRIPTION");
 
+        NSLog(@"%s | %@", __PRETTY_FUNCTION__, [NSThread callStackSymbols]);
         [self scheduleRequest:[PNSubscribeRequest subscribeRequestForChannels:channels byUserRequest:YES]
       shouldObserveProcessing:NO];
     }
@@ -534,6 +548,7 @@
         [subscriptionChannels makeObjectsPerformSelector:@selector(resetUpdateTimeToken)];
     }
 
+    NSLog(@"%s | %@", __PRETTY_FUNCTION__, [NSThread callStackSymbols]);
     PNSubscribeRequest *subscribeRequest = [PNSubscribeRequest subscribeRequestForChannels:subscriptionChannels byUserRequest:YES];
     subscribeRequest.closeConnection = shouldReconnect;
     [self scheduleRequest:subscribeRequest shouldObserveProcessing:YES];
@@ -546,6 +561,7 @@
 
 - (void)subscribeOnPreviousChannels {
 
+    NSLog(@"%s | %@", __PRETTY_FUNCTION__, [NSThread callStackSymbols]);
     NSArray *channelsList = [self.subscribedChannelsSet allObjects];
     BOOL shouldObserve = [[PNChannel largestTimetokenFromChannels:channelsList] isEqualToString:@"0"];
     PNSubscribeRequest *resubscribeRequest = [PNSubscribeRequest subscribeRequestForChannels:channelsList byUserRequest:NO];
@@ -634,6 +650,7 @@
 
     if ([currentlySubscribedChannels count] > 0) {
 
+        NSLog(@"%s | %@", __PRETTY_FUNCTION__, [NSThread callStackSymbols]);
         PNSubscribeRequest *subscribeRequest = [PNSubscribeRequest subscribeRequestForChannels:[currentlySubscribedChannels allObjects]
                                                                                  byUserRequest:isLeavingByUserRequest];
         subscribeRequest.closeConnection = !withPresenceEvent;
@@ -1200,6 +1217,13 @@
 
         [self startChannelIdleTimer];
     }
+}
+
+- (void)connection:(PNConnection *)connection didReconnectOnErrorToHost:(NSString *)hostName {
+
+    [self startChannelIdleTimer];
+
+    [super connection:connection didReconnectOnErrorToHost:hostName];
 }
 
 - (void)connection:(PNConnection *)connection didDisconnectFromHost:(NSString *)hostName {

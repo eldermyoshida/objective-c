@@ -24,44 +24,43 @@
 @required
 
 /**
- * Sent to the delegate when both streams (read/write) 
- * connected to the opened socket
+ * Inform delegate that communication channel configuration failed and probably library unable to proceed
+ * its normal operation.
+ */
+- (void)connectionConfigurationDidFail:(PNConnection *)connection;
+
+/**
+ * Sent to the delegate when both streams (read/write) connected to the opened socket
  */
 - (void)connection:(PNConnection *)connection didConnectToHost:(NSString *)hostName;
 
 /**
- * Sent to the delegate when both streams (read/write)
- * was reconnected after receiving error
+ * Sent to the delegate when both streams (read/write) was reconnected after receiving error
  */
 - (void)connection:(PNConnection *)connection didReconnectOnErrorToHost:(NSString *)hostName;
 
 /**
- * Sent to the PubNub client when connection resumed it's operation
- * and ready to process requests
+ * Sent to the PubNub client when connection resumed it's operation and ready to process requests
  */
 - (void)connectionDidResume:(PNConnection *)connection;
 
 /**
- * Sent to the delegate each time when new response
- * arrives via socket from remote server
+ * Sent to the delegate each time when new response arrives via socket from remote server
  */
 - (void)connection:(PNConnection *)connection didReceiveResponse:(PNResponse *)response;
 
 /**
- * Sent to the delegate when both streams (read/write)
- * disconnected from remote host
+ * Sent to the delegate when both streams (read/write) disconnected from remote host
  */
 - (void)connection:(PNConnection *)connection didDisconnectFromHost:(NSString *)hostName;
 
 /**
- * Sent to the delegate when one of the stream (read/write)
- * was unable to open connection with socket
+ * Sent to the delegate when one of the stream (read/write) was unable to open connection with socket
  */
 - (void)connection:(PNConnection *)connection connectionDidFailToHost:(NSString *)hostName withError:(PNError *)error;
 
 /**
- * Sent to the delegate when one of the streams recieved
- * error and connection is forced to close because of it
+ * Sent to the delegate when one of the streams received error and connection is forced to close because of it
  */
 - (void)connection:(PNConnection *)connection willDisconnectFromHost:(NSString *)host withError:(PNError *)error;
 

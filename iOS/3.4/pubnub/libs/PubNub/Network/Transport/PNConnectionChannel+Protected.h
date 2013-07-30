@@ -28,6 +28,11 @@
 - (BOOL)isSuspended;
 
 /**
+ * Check whether channel is suspended or not
+ */
+- (BOOL)isConnectionSuspended;
+
+/**
  * Returns whether communication channel is waiting for
  * request processing completion from backebd or not
  */

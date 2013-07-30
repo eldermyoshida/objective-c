@@ -2147,6 +2147,11 @@ withCompletionHandlingBlock:(PNClientChannelSubscriptionHandlerBlock)handlerBloc
 
 #pragma mark - Connection channel delegate methods
 
+- (void)connectionChannelConfigurationDidFail:(PNConnectionChannel *)channel {
+
+    //TODO: Disconnect all channels and report client error
+}
+
 - (void)connectionChannel:(PNConnectionChannel *)channel didConnectToHost:(NSString *)host {
     
     // Check whether all communication channels connected and whether
@@ -2445,8 +2450,10 @@ withCompletionHandlingBlock:(PNClientChannelSubscriptionHandlerBlock)handlerBloc
 
 - (void)handleApplicationDidEnterForegroundState:(NSNotification *)notification {
 
-    BOOL canRunInBackground = [self canRunInBackground];
-    if (!canRunInBackground) {
+    [self.reachability refreshReachabilityState];
+    NSLog(@">>>>>> SERVICE IS REACHABLE? %@", [self.reachability isServiceAvailable]?@"YES":@"NO");
+
+    if ([self.reachability isServiceAvailable]) {
 
         [self.messagingChannel resume];
         [self.serviceChannel resume];

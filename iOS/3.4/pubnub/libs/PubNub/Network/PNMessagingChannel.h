@@ -45,6 +45,8 @@
 + (PNMessagingChannel *)messageChannelWithDelegate:(id<PNConnectionChannelDelegate>)delegate;
 
 
+#pragma mark - Instance methods
+
 #pragma mark - Connection management
 
 /**

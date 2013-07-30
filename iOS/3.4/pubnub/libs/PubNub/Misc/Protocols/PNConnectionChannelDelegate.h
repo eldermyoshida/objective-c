@@ -28,6 +28,11 @@
 @required
 
 /**
+ * Sent to the PubNub client when connection channel was unable to enable connection
+ */
+- (void)connectionChannelConfigurationDidFail:(PNConnectionChannel *)channel;
+
+/**
  * Sent to the PubNub client when connection channel successfully
  * configured and connected to the specified PubNub services origin
  */
